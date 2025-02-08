@@ -26,7 +26,10 @@ venv/
 # Generated files
 *.gif
 temp_frame_*.png
+*.mp4
+test_frames/
 
 # IDE specific files
 .vscode/
 .idea/
+.DS_Store
