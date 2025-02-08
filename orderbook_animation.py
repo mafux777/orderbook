@@ -7,6 +7,7 @@ from datetime import datetime, timedelta
 from dateutil.relativedelta import relativedelta
 import numpy as np
 import imageio
+import tqdm
 
 class OrderBookAnimator:
     def __init__(self, api_key=None):
@@ -87,8 +88,10 @@ class OrderBookAnimator:
                 ask['side'] = 'ask'
                 processed_orders.append(ask)
         
-        # Convert to DataFrame and set time as index
-        orderbook_df = pd.DataFrame(processed_orders).set_index('time')
+        # Convert to DataFrame and set time as index, preserving UTC timezone
+        orderbook_df = pd.DataFrame(processed_orders)
+        orderbook_df['time'] = pd.to_datetime(orderbook_df['time'], utc=True)  # Force UTC
+        orderbook_df = orderbook_df.set_index('time')
         
         # Convert price and size to float
         orderbook_df['price'] = orderbook_df['price'].astype(float)
@@ -175,53 +178,245 @@ class OrderBookAnimator:
         else:
             plt.show()
             
-    def create_animation(self, orderbook_df, output_file='orderbook.gif', frame_duration_ms=100):
-        """Create an animated visualization of the orderbook over time"""
+    def preprocess_candle_data(self, raw_candle_data):
+        """Transform raw candle data into a pandas DataFrame"""
+        candles = pd.DataFrame(raw_candle_data)
+        candles['time'] = pd.to_datetime(candles['time'], utc=True)  # Force UTC
+        candles = candles.set_index('time')
+        
+        # Convert price columns to float
+        price_columns = ['price_open', 'price_close', 'price_high', 'price_low']
+        for col in price_columns:
+            candles[col] = candles[col].astype(float)
+        
+        return candles
+
+    def create_animation(self, orderbook_df, candle_df, output_file='orderbook.mp4', frame_interval_ms=100):
+        """
+        Create an animated visualization with growing candlestick chart and orderbook
+        """
         if orderbook_df is None or orderbook_df.empty:
             print("No market data available for animation")
             return
         
-        # Get unique timestamps (one per minute)
-        timestamps = sorted(orderbook_df.index.unique())
-        print(f"Generating {len(timestamps)} unique frames...")
+        # Fixed ranges for orderbook
+        min_price, max_price = 2600, 3200
+        max_size = 500  # Fixed at 500 as requested
         
-        # Create a list to store our frames
-        frames = []
+        # Create price bins with $1 width
+        price_step = 1.0
+        num_bins = int((max_price - min_price) / price_step) + 1
+        price_bins = np.linspace(min_price, max_price, num_bins)
         
-        # Set up the figure with a specific DPI
-        fig, ax = plt.subplots(figsize=(10, 6), dpi=100)
+        # Get unique timestamps and ensure consistent timezone handling
+        timestamps = pd.to_datetime(orderbook_df.index.unique())  # Keep UTC
+        timestamps = sorted(timestamps)
         
-        # Generate each unique frame
-        for i, timestamp in enumerate(timestamps):
-            snapshot = orderbook_df.loc[timestamp]
-            ax.clear()
+        # Create figure with two subplots
+        fig, (ax_price, ax_book) = plt.subplots(2, 1, figsize=(10, 12), height_ratios=[1, 2])
+        
+        def animate(frame):
+            current_timestamp = timestamps[frame]
             
-            # Use the same plotting logic as plot_orderbook_snapshot
-            min_price, max_price = 3000, 3200
-            max_size = 500
+            # Clear both plots
+            ax_price.clear()
+            ax_book.clear()
             
-            # Filter data based on price range
-            snapshot_df = snapshot[
+            # Plot candlestick data (top subplot)
+            # Get only candles up to current timestamp (both are now UTC)
+            mask = candle_df.index <= current_timestamp
+            current_candles = candle_df[mask]
+            
+            # Plot each candle
+            for idx, candle in current_candles.iterrows():
+                # Determine candle color (green for up, red for down)
+                color = 'green' if candle['price_close'] >= candle['price_open'] else 'red'
+                
+                # Plot candle body
+                body_bottom = min(candle['price_open'], candle['price_close'])
+                body_height = abs(candle['price_close'] - candle['price_open'])
+                ax_price.bar(idx, body_height, bottom=body_bottom, color=color, alpha=0.5, width=0.8)
+                
+                # Plot high/low wicks
+                ax_price.vlines(idx, candle['price_low'], candle['price_high'], color=color)
+            
+            # Set price chart properties
+            ax_price.set_ylim(min_price, max_price)
+            ax_price.set_title('ETH/USD Price')
+            
+            # Plot orderbook data (bottom subplot)
+            snapshot = orderbook_df.loc[current_timestamp]
+            snapshot = snapshot[
                 (snapshot['price'] >= min_price) & 
                 (snapshot['price'] <= max_price)
             ]
             
-            # Create price bins with $1 width
-            price_step = 1.0
-            num_bins = int((max_price - min_price) / price_step) + 1
-            price_bins = np.linspace(min_price, max_price, num_bins)
+            # Create histograms
+            bid_mask = snapshot['side'] == 'bid'
+            ask_mask = snapshot['side'] == 'ask'
             
-            # Create histograms (with observed=True to fix warning)
-            bid_mask = snapshot_df['side'] == 'bid'
-            ask_mask = snapshot_df['side'] == 'ask'
+            bid_histogram = snapshot[bid_mask].groupby(
+                pd.cut(snapshot[bid_mask]['price'].astype(float), bins=price_bins)
+            )['size'].sum()
             
-            bid_histogram = snapshot_df[bid_mask].groupby(
-                pd.cut(snapshot_df[bid_mask]['price'], bins=price_bins),
+            ask_histogram = snapshot[ask_mask].groupby(
+                pd.cut(snapshot[ask_mask]['price'].astype(float), bins=price_bins)
+            )['size'].sum()
+            
+            # Calculate midpoints
+            bid_midpoints = [(interval.left + interval.right) / 2 for interval in bid_histogram.index]
+            ask_midpoints = [(interval.left + interval.right) / 2 for interval in ask_histogram.index]
+            
+            # Plot orderbook
+            ax_book.barh(ask_midpoints, ask_histogram.values, height=0.9, label='Asks', color='red', alpha=0.5)
+            ax_book.barh(bid_midpoints, bid_histogram.values, height=0.9, label='Bids', color='green', alpha=0.5)
+            
+            # Set fixed axis limits
+            ax_book.set_ylim(min_price, max_price)
+            ax_book.set_xlim(0, max_size)
+            
+            # Labels and title
+            timestamp_str = pd.Timestamp(current_timestamp).strftime('%Y-%m-%d %H:%M:%S')
+            ax_book.set_xlabel('Size')
+            ax_book.set_ylabel('Price')
+            ax_book.set_title(f'Order Book - {timestamp_str}')
+            ax_book.legend()
+            
+            # Adjust layout
+            plt.tight_layout()
+        
+        # Create and save animation
+        print(f"Saving animation with {len(timestamps)} frames...")
+        anim = animation.FuncAnimation(
+            fig, 
+            animate,
+            frames=len(timestamps),
+            interval=frame_interval_ms,
+            repeat=False
+        )
+        
+        writer = animation.FFMpegWriter(fps=1000/frame_interval_ms)
+        anim.save(output_file, writer=writer)
+        plt.close()
+
+    def fetch_market_candles(self, market, start_time, end_time):
+        """
+        Fetch market candle data from CoinMetrics API using parallel method
+        """
+        try:
+            print(f"Fetching candle data for {market}")
+            
+            candle_data = self.client.get_market_candles(
+                markets=[market],
+                start_time=start_time,
+                end_time=end_time,
+                frequency='1m'
+            ).parallel(time_increment=relativedelta(minutes=10)).to_list()
+            
+            if candle_data and len(candle_data) > 0:
+                print(f"Successfully fetched {len(candle_data)} candles")
+                return candle_data
+            else:
+                print("No candle data returned from API")
+                return None
+            
+        except Exception as e:
+            print(f"Error fetching candle data: {str(e)}")
+            return None
+
+    def create_test_frames(self, orderbook_df, candle_df, output_dir='test_frames', num_frames=30):
+        """Create test frames for visual inspection and layout tuning"""
+        os.makedirs(output_dir, exist_ok=True)
+        
+        # Get timestamps for the first num_frames minutes
+        timestamps = pd.to_datetime(orderbook_df.index.unique())
+        timestamps = sorted(timestamps)[:num_frames]
+        
+        # Calculate price range from all candles in our timeframe
+        window_start = timestamps[0]
+        window_end = timestamps[-1]
+        window_mask = (candle_df.index >= window_start) & (candle_df.index <= window_end)
+        window_candles = candle_df[window_mask]
+        
+        # Calculate price range
+        price_min = min(
+            window_candles['price_low'].min(),
+            window_candles['price_open'].min(),
+            window_candles['price_close'].min()
+        )
+        price_max = max(
+            window_candles['price_high'].max(),
+            window_candles['price_open'].max(),
+            window_candles['price_close'].max()
+        )
+        
+        # Add 1% padding to price range
+        price_padding = (price_max - price_min) * 0.01
+        price_min -= price_padding
+        price_max += price_padding
+        
+        # Create price bins with $1 width for orderbook histogram
+        price_step = 1.0
+        num_bins = int((price_max - price_min) / price_step) + 1
+        price_bins = np.linspace(price_min, price_max, num_bins)
+        
+        # Fixed max size for orderbook
+        max_size = 500
+        
+        print(f"Generating {len(timestamps)} frames...")
+        print(f"Price range: {price_min:.2f} - {price_max:.2f}")
+        
+        # Create progress bar
+        pbar = tqdm.tqdm(enumerate(timestamps), total=len(timestamps), desc="Generating frames")
+        
+        for i, timestamp in pbar:
+            fig, (ax_price, ax_book) = plt.subplots(2, 1, figsize=(10, 12), height_ratios=[1, 2])
+            
+            # Get last 10 candles up to current timestamp
+            mask = candle_df.index <= timestamp
+            current_candles = candle_df[mask].tail(10)  # Get only last 10 candles
+            
+            # Calculate x-positions for candles (0 to 9 for the last 10 candles)
+            x_positions = range(len(current_candles))
+            
+            # Plot each candle with fixed width
+            for x_pos, (idx, candle) in enumerate(current_candles.iterrows()):
+                color = 'green' if candle['price_close'] >= candle['price_open'] else 'red'
+                body_bottom = min(candle['price_open'], candle['price_close'])
+                body_height = abs(candle['price_close'] - candle['price_open'])
+                
+                # Plot candle body with fixed width (e.g., 0.8)
+                ax_price.bar(x_pos, body_height, bottom=body_bottom, color=color, 
+                            alpha=0.5, width=0.8)
+                # Plot wicks
+                ax_price.vlines(x_pos, candle['price_low'], candle['price_high'], color=color)
+            
+            # Set fixed x-axis range (0-10 for 10 candles)
+            ax_price.set_xlim(-0.5, 9.5)  # Add 0.5 padding on each side
+            
+            # Format x-axis to show times for the candles
+            x_labels = [pd.Timestamp(idx).strftime('%H:%M') for idx in current_candles.index]
+            ax_price.set_xticks(x_positions)
+            ax_price.set_xticklabels(x_labels, rotation=45)
+            
+            # Plot orderbook data (bottom subplot)
+            snapshot = orderbook_df.loc[timestamp]
+            snapshot = snapshot[
+                (snapshot['price'] >= price_min) & 
+                (snapshot['price'] <= price_max)
+            ]
+            
+            # Create histograms with observed=True to fix warnings
+            bid_mask = snapshot['side'] == 'bid'
+            ask_mask = snapshot['side'] == 'ask'
+            
+            bid_histogram = snapshot[bid_mask].groupby(
+                pd.cut(snapshot[bid_mask]['price'].astype(float), bins=price_bins),
                 observed=True
             )['size'].sum()
             
-            ask_histogram = snapshot_df[ask_mask].groupby(
-                pd.cut(snapshot_df[ask_mask]['price'], bins=price_bins),
+            ask_histogram = snapshot[ask_mask].groupby(
+                pd.cut(snapshot[ask_mask]['price'].astype(float), bins=price_bins),
                 observed=True
             )['size'].sum()
             
@@ -229,60 +424,54 @@ class OrderBookAnimator:
             bid_midpoints = [(interval.left + interval.right) / 2 for interval in bid_histogram.index]
             ask_midpoints = [(interval.left + interval.right) / 2 for interval in ask_histogram.index]
             
-            # Plot the data
-            ax.barh(ask_midpoints, ask_histogram.values, height=0.9, label='Asks', color='red', alpha=0.5)
-            ax.barh(bid_midpoints, bid_histogram.values, height=0.9, label='Bids', color='green', alpha=0.5)
+            # Plot orderbook
+            ax_book.barh(ask_midpoints, ask_histogram.values, height=0.9, label='Asks', color='red', alpha=0.5)
+            ax_book.barh(bid_midpoints, bid_histogram.values, height=0.9, label='Bids', color='green', alpha=0.5)
             
-            # Set fixed axis limits
-            ax.set_ylim(min_price, max_price)
-            ax.set_xlim(0, max_size)
+            # Set fixed axis limits and grid
+            ax_book.set_ylim(price_min, price_max)
+            ax_book.set_xlim(0, max_size)
+            ax_book.grid(True, alpha=0.3)
             
+            # Labels and title
             timestamp_str = pd.Timestamp(timestamp).strftime('%Y-%m-%d %H:%M:%S')
-            ax.set_xlabel('Size')
-            ax.set_ylabel('Price')
-            ax.set_title(f'Order Book - {timestamp_str}')
-            ax.legend()
+            ax_book.set_xlabel('Size')
+            ax_book.set_ylabel('Price')
+            ax_book.set_title(f'Order Book - {timestamp_str}')
+            ax_book.legend()
             
-            # Instead of buffer manipulation, save to a temporary file and read it back
-            temp_file = f'temp_frame_{i}.png'
-            fig.savefig(temp_file)
-            img = imageio.imread(temp_file)
-            frames.append(img)
-            os.remove(temp_file)  # Clean up temporary file
+            # Adjust spacing between subplots
+            plt.tight_layout()
             
-            if i % 100 == 0:  # Progress update every 100 frames
-                print(f"Generated frame {i}/{len(timestamps)}")
-        
-        plt.close()
-        
-        # Save as GIF
-        print(f"Saving animation with {len(frames)} frames...")
-        imageio.mimsave(output_file, frames, duration=frame_duration_ms/1000.0)
+            # Save frame
+            frame_file = os.path.join(output_dir, f'frame_{i:03d}.png')
+            plt.savefig(frame_file, dpi=100, bbox_inches='tight')
+            plt.close()
 
 def main():
     # Initialize animator
     animator = OrderBookAnimator()
     
-    # Use the same market and time range as the notebook
+    # Use the same market and time range as before
     market = 'kraken-eth-usd-spot'
     start_time = '2025-02-02T00:00:00Z'
-    end_time = '2025-02-03T00:00:00Z'
+    end_time = '2025-02-02T00:30:00Z'  # 30 minutes of data
     
     print(f"Fetching data for {market} from {start_time} to {end_time}")
-    raw_market_data = animator.fetch_market_data(market, start_time, end_time)
     
-    if raw_market_data is not None:
-        print(f"Fetched {len(raw_market_data)} orderbook snapshots")
-        if len(raw_market_data) > 0:
-            print("\nProcessing orderbook data...")
-            processed_data = animator.preprocess_orderbook_data(raw_market_data)
-            print(f"Processed data shape: {processed_data.shape}")
-            
-            
-            
-            print("\nCreating animation...")
-            animator.create_animation(processed_data, 'orderbook_animation.gif')
-            print("Animation saved to orderbook_animation.gif")
+    # Fetch both orderbook and candle data
+    raw_market_data = animator.fetch_market_data(market, start_time, end_time)
+    raw_candle_data = animator.fetch_market_candles(market, start_time, end_time)
+    
+    if raw_market_data is not None and raw_candle_data is not None:
+        print("\nProcessing orderbook data...")
+        processed_orderbook = animator.preprocess_orderbook_data(raw_market_data)
+        
+        print("\nProcessing candle data...")
+        processed_candles = animator.preprocess_candle_data(raw_candle_data)
+        
+        print("\nGenerating test frames...")
+        animator.create_test_frames(processed_orderbook, processed_candles, num_frames=30)  # 30 frames
 
 if __name__ == "__main__":
     main() 
