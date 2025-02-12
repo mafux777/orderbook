@@ -100,23 +100,6 @@ class OrderBookAnimator:
         
         return orderbook_df
 
-    def get_data_bounds(self, df, column, lower_percentile=10, upper_percentile=90):
-        """
-        Calculate bounds for a column based on percentiles
-        
-        Args:
-            df: DataFrame containing the data
-            column: Column name to calculate bounds for
-            lower_percentile: Lower percentile cutoff (default: 10)
-            upper_percentile: Upper percentile cutoff (default: 90)
-        
-        Returns:
-            tuple: (min_value, max_value)
-        """
-        min_value = df[column].quantile(lower_percentile/100)
-        max_value = df[column].quantile(upper_percentile/100)
-        return min_value, max_value
-
     def plot_orderbook_snapshot(self, snapshot_df, output_file=None):
         """
         Create a histogram plot for a single orderbook snapshot with fixed ranges
@@ -192,65 +175,35 @@ class OrderBookAnimator:
         
         return candles
 
-    def _calculate_smooth_price_range(self, candle_df, current_timestamp, window_minutes=30, padding_percentage=0.1):
-        """Calculate a smoothed price range centered around recent price activity
-        
-        Args:
-            candle_df: DataFrame containing candlestick data
-            current_timestamp: Current frame's timestamp
-            window_minutes: Number of minutes to look back/forward for range calculation
-            padding_percentage: Percentage of padding to add above/below price range
-        
-        Returns:
-            tuple: (price_min, price_max)
-        """
-        # Get window of candles centered on current timestamp
-        window_start = current_timestamp - pd.Timedelta(minutes=window_minutes//2)
-        window_end = current_timestamp + pd.Timedelta(minutes=window_minutes//2)
-        mask = (candle_df.index >= window_start) & (candle_df.index <= window_end)
-        window_candles = candle_df[mask]
-        
-        if window_candles.empty:
-            return None, None
-        
-        # Calculate price range from window
-        price_min = min(
-            window_candles['price_low'].min(),
-            window_candles['price_open'].min(),
-            window_candles['price_close'].min()
-        )
-        price_max = max(
-            window_candles['price_high'].max(),
-            window_candles['price_open'].max(),
-            window_candles['price_close'].max()
-        )
-        
-        # Add padding
-        price_range = price_max - price_min
-        padding = price_range * padding_percentage
-        price_min -= padding
-        price_max += padding
-        
-        return price_min, price_max
+    def calculate_y_limits(self, orderbook_df):
+        """Calculate y-axis limits for each timestamp in the orderbook data."""
+        # Ensure the index is a datetime index
+        orderbook_df.index = pd.to_datetime(orderbook_df.index)
 
-    def _smooth_price_range(self, new_min, new_max, prev_min, prev_max, smoothing_factor=0.1):
-        """Smooth the transition between price ranges
+        # Group by timestamp and calculate min and max prices
+        y_limits_df = orderbook_df.groupby(orderbook_df.index).agg(
+            y_min=('price', 'min'),
+            y_max=('price', 'max')
+        ).reset_index()
+
+        # Calculate centered moving averages over a 20-minute window (10 minutes before and after)
+        window_size = 20
+        y_limits_df['y_min_ma'] = y_limits_df['y_min'].rolling(
+            window=window_size, center=True, min_periods=1
+        ).mean()
+        y_limits_df['y_max_ma'] = y_limits_df['y_max'].rolling(
+            window=window_size, center=True, min_periods=1
+        ).mean()
+
+        # Add padding as a percentage of the price range
+        padding_percentage = 0.25  # 5% padding
+        price_range = y_limits_df['y_max_ma'] - y_limits_df['y_min_ma']
+        padding = price_range * padding_percentage
         
-        Args:
-            new_min, new_max: New calculated price range
-            prev_min, prev_max: Previous frame's price range
-            smoothing_factor: How quickly to adjust to new range (0-1)
-        
-        Returns:
-            tuple: (smoothed_min, smoothed_max)
-        """
-        if prev_min is None or prev_max is None:
-            return new_min, new_max
-        
-        smoothed_min = prev_min + (new_min - prev_min) * smoothing_factor
-        smoothed_max = prev_max + (new_max - prev_max) * smoothing_factor
-        
-        return smoothed_min, smoothed_max
+        y_limits_df['y_min_ma'] = y_limits_df['y_min_ma'] - padding
+        y_limits_df['y_max_ma'] = y_limits_df['y_max_ma'] + padding
+
+        return y_limits_df.set_index('time')
 
     def create_animation(self, orderbook_df, candle_df, output_file='orderbook.mp4', frame_interval_ms=100):
         """Create an animated visualization with sliding window candlestick chart and orderbook"""
@@ -258,37 +211,35 @@ class OrderBookAnimator:
             print("No market data available for animation")
             return
         
-        # Get timestamps
-        timestamps = pd.to_datetime(orderbook_df.index.unique())
-        timestamps = sorted(timestamps)
-        
-        # Initialize price range tracking variables
-        self.current_price_min = None
-        self.current_price_max = None
-        
+        # Calculate y-axis limits
+        y_limits_df = self.calculate_y_limits(orderbook_df)
+
         # Create figure
         fig, (ax_price, ax_book) = plt.subplots(2, 1, figsize=(10, 12), height_ratios=[1, 2])
         
         # Create progress bar
-        pbar = tqdm.tqdm(total=len(timestamps), desc="Generating frames")
+        pbar = tqdm.tqdm(total=len(y_limits_df), desc="Generating frames")
         
         def animate(frame):
+            # Pass the calculated moving average limits to the plot frame
             self._plot_frame(
                 fig=fig,
                 ax_price=ax_price,
                 ax_book=ax_book,
-                timestamp=timestamps[frame],
+                timestamp=y_limits_df.index[frame],  # Access the timestamp from the index directly
                 candle_df=candle_df,
-                orderbook_df=orderbook_df
+                orderbook_df=orderbook_df,
+                y_min=y_limits_df['y_min_ma'].iloc[frame],  # Pass moving average min
+                y_max=y_limits_df['y_max_ma'].iloc[frame]   # Pass moving average max
             )
             pbar.update(1)
         
         # Create and save animation
-        print(f"Creating animation with {len(timestamps)} frames...")
+        print(f"Creating animation with {len(y_limits_df)} frames...")
         anim = animation.FuncAnimation(
             fig, 
             animate,
-            frames=len(timestamps),
+            frames=len(y_limits_df),
             interval=frame_interval_ms,
             repeat=False
         )
@@ -326,90 +277,43 @@ class OrderBookAnimator:
     def create_test_frames(self, orderbook_df, candle_df, output_dir='test_frames', num_frames=30):
         """Create test frames for visual inspection and layout tuning"""
         os.makedirs(output_dir, exist_ok=True)
-        
-        # Get timestamps for the first num_frames minutes
-        timestamps = pd.to_datetime(orderbook_df.index.unique())
-        timestamps = sorted(timestamps)[:num_frames]
-        
-        # Calculate price range from all candles in our timeframe
-        window_start = timestamps[0]
-        window_end = timestamps[-1]
-        window_mask = (candle_df.index >= window_start) & (candle_df.index <= window_end)
-        window_candles = candle_df[window_mask]
-        
-        # Calculate price range
-        price_min = min(
-            window_candles['price_low'].min(),
-            window_candles['price_open'].min(),
-            window_candles['price_close'].min()
-        )
-        price_max = max(
-            window_candles['price_high'].max(),
-            window_candles['price_open'].max(),
-            window_candles['price_close'].max()
-        )
-        
-        # Add 1% padding to price range
-        price_padding = (price_max - price_min) * 0.01
-        price_min -= price_padding
-        price_max += price_padding
-        
-        # Create price bins
-        price_step = 1.0
-        num_bins = int((price_max - price_min) / price_step) + 1
-        price_bins = np.linspace(price_min, price_max, num_bins)
-        
-        print(f"Generating {len(timestamps)} frames...")
-        print(f"Price range: {price_min:.2f} - {price_max:.2f}")
-        
-        # Create progress bar
-        pbar = tqdm.tqdm(enumerate(timestamps), total=len(timestamps), desc="Generating frames")
-        
-        for i, timestamp in pbar:
-            # Create figure for this frame
+
+        # Calculate y-axis limits
+        y_limits_df = self.calculate_y_limits(orderbook_df)
+
+        # Get timestamps for the first num_frames
+        timestamps = list(y_limits_df.index)[0:num_frames]
+
+        for frame_index, timestamp in enumerate(timestamps):
+            # Create a new figure for each frame
             fig, (ax_price, ax_book) = plt.subplots(2, 1, figsize=(10, 12), height_ratios=[1, 2])
             
-            # Use helper method to plot the frame
-            self._plot_frame(
-                fig=fig,
-                ax_price=ax_price,
-                ax_book=ax_book,
-                timestamp=timestamp,
-                candle_df=candle_df,
-                orderbook_df=orderbook_df,
-                price_range=(price_min, price_max),
-                price_bins=price_bins
-            )
-            
-            # Save frame
-            frame_file = os.path.join(output_dir, f'frame_{i:03d}.png')
-            plt.savefig(frame_file, dpi=100, bbox_inches='tight')
-            plt.close()
+            # Plot the frame data
+            self.plot_frame_data(fig, ax_price, ax_book, timestamp, candle_df, orderbook_df,
+                                 y_min=y_limits_df['y_min'].iloc[frame_index],
+                                 y_max=y_limits_df['y_max'].iloc[frame_index])
 
-    def _plot_frame(self, fig, ax_price, ax_book, timestamp, candle_df, orderbook_df, max_size=500):
+            # Save the frame as an image file
+            frame_filename = os.path.join(output_dir, f'frame_{frame_index:03d}.png')
+            plt.savefig(frame_filename)
+            plt.close(fig)  # Close the figure to free memory
+
+    def _plot_frame(self, fig, ax_price, ax_book, timestamp, candle_df, orderbook_df, y_min, y_max, max_size=500):
         """Helper method to plot a single frame of the visualization"""
         # Clear both plots
         ax_price.clear()
         ax_book.clear()
         
-        # Calculate new price range
-        new_min, new_max = self._calculate_smooth_price_range(candle_df, timestamp)
-        
-        # Smooth the transition
-        price_min, price_max = self._smooth_price_range(
-            new_min, new_max,
-            self.current_price_min, self.current_price_max
-        )
-        
-        # Update current price range
-        self.current_price_min = price_min
-        self.current_price_max = price_max
-        
-        # Create price bins
-        price_step = 1.0
-        num_bins = int((price_max - price_min) / price_step) + 1
-        price_bins = np.linspace(price_min, price_max, num_bins)
-        
+        # Use common plotting method
+        self.plot_frame_data(fig, ax_price, ax_book, timestamp, candle_df, orderbook_df, y_min, y_max, max_size)
+
+    def plot_frame_data(self, fig, ax_price, ax_book, timestamp, candle_df, orderbook_df, y_min, y_max, max_size=500):
+        """Common method to plot frame data for both test frames and animation"""
+        # Set fixed y-axis limits for both plots
+        y_range = [y_min, y_max]
+        ax_price.set_ylim(y_range)
+        ax_book.set_ylim(y_range)
+
         # Get last 10 candles up to current timestamp
         mask = candle_df.index <= timestamp
         current_candles = candle_df[mask].tail(10)
@@ -435,10 +339,11 @@ class OrderBookAnimator:
         
         # Plot orderbook
         snapshot = orderbook_df.loc[timestamp]
-        snapshot = snapshot[
-            (snapshot['price'] >= price_min) & 
-            (snapshot['price'] <= price_max)
-        ]
+        
+        # Create price bins with fixed width
+        price_step = 1.0
+        num_bins = int((y_max - y_min) / price_step) + 1
+        price_bins = np.linspace(y_min, y_max, num_bins)
         
         # Create histograms
         bid_mask = snapshot['side'] == 'bid'
@@ -461,9 +366,9 @@ class OrderBookAnimator:
         ax_book.barh(ask_midpoints, ask_histogram.values, height=0.9, label='Asks', color='red', alpha=0.5)
         ax_book.barh(bid_midpoints, bid_histogram.values, height=0.9, label='Bids', color='green', alpha=0.5)
         
-        # Set orderbook properties
-        ax_book.set_ylim(price_min, price_max)
+        # Set orderbook properties and ensure y-axis limits are maintained
         ax_book.set_xlim(0, max_size)
+        ax_book.set_ylim(y_range)  # Set again to ensure it's maintained
         ax_book.grid(True, alpha=0.3)
         
         timestamp_str = pd.Timestamp(timestamp).strftime('%Y-%m-%d %H:%M:%S')
@@ -471,10 +376,6 @@ class OrderBookAnimator:
         ax_book.set_ylabel('Price')
         ax_book.set_title(f'Order Book - {timestamp_str}')
         ax_book.legend()
-        
-        # Update y-axis limits for both plots
-        ax_price.set_ylim(price_min, price_max)
-        ax_book.set_ylim(price_min, price_max)
         
         # Add market name between the plots
         market_name = orderbook_df['market'].iloc[0].upper()
